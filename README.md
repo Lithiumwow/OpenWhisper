@@ -89,7 +89,7 @@ Flow:
 
 1. Detects how many speakers are in the file.
 2. Shows sample lines per speaker (default every ~120s; `--sample-interval`).
-3. You type a name (e.g. `Systemair`, `UWO`).
+3. You type a name (e.g. `Alice`, `Bob`).
 4. Rewrites the SRT with `Name: …` on every matching line.
 
 Useful flags:

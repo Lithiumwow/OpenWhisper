@@ -58,8 +58,8 @@ HF_TOKEN=hf_your_token_here
 ```text
 --sample-interval 90
 --play-samples
---names "Systemair,UWO"
---names "SPEAKER_00=Systemair,SPEAKER_01=UWO"
+--names "Alice,Bob"
+--names "SPEAKER_00=Alice,SPEAKER_01=Bob"
 --hf-token hf_...
 --force-transcribe
 --force-diarize
