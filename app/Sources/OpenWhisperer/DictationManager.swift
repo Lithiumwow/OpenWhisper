@@ -1,0 +1,1150 @@
+import Foundation
+import AppKit
+import Combine
+import os.log
+import OpenWhispererKit
+
+private let dictLog = OSLog(subsystem: "com.openwhisperer.app", category: "dictation")
+
+/// Orchestrates the record → upload → type cycle for all interaction modes.
+/// Feeds audio to the in-process STT model and types the result into the focused app.
+class DictationManager: ObservableObject {
+    let recorder = AudioRecorder()
+    let keywordDetector = KeywordDetector()
+    /// In-process WhisperKit STT (CoreML/ANE). Restored 2026-07-30, replacing Parakeet
+    /// 2026-07-13 — see the engine-configurability spec's migration addendum.
+    let whisper = SpeechTranscriber()
+    /// In-process TTS playback (Phase 3). Injected by `AppDelegate` from `ServerManager`; used by
+    /// `killTTS()` for instant barge-in. Optional so headless/test paths without a server still run.
+    var ttsController: TTSPlaybackController?
+
+    @Published var lastTranscription: String = ""
+    @Published var error: String?
+    /// Mirrors recorder.state as a direct @Published so SwiftUI views reliably update.
+    @Published var recorderState: AudioRecorder.State = .idle
+    /// Current interaction mode
+    @Published var interactionMode: InteractionMode = .pressToTalk {
+        didSet {
+            if interactionMode != oldValue {
+                handleModeChange(from: oldValue, to: interactionMode)
+                TranscriptionOverlay.shared.interactionMode = interactionMode
+            }
+        }
+    }
+    /// Whether TTS is currently playing (tracked via lock file)
+    @Published var ttsPlaying = false
+    /// Whether hands-free is calibrating ambient noise
+    @Published var isCalibrating = false
+    /// Non-nil while the speech model is downloading/loading, or holding a failure
+    /// message (status string for the UI — menu bar and standby overlay both read it).
+    @Published var sttStatus: String?
+    /// True once the STT model is loaded and ready to transcribe.
+    @Published var sttModelReady = false
+    /// True when the speech-model load failed (offers a Retry in the UI).
+    @Published var sttFailed = false
+    /// Last whole percent shown for the first-run model download (dedups UI updates).
+    private var lastReportedDownloadPct = -1
+    /// True while the next/current turn's reply is expected to be spoken: a fresh
+    /// unclaimed `voice_turn` signal (pre-submit), or a claimed turn whose reply is
+    /// still pending (`speak_pending/` marker). Drives the will-speak indicator in
+    /// the menu bar icon and the status pill.
+    @Published var speakArmed = false
+    private var speakArmedTimer: Timer?
+    /// True when the last dictation landed in a plausible CLI host (terminal/IDE)
+    /// — an app where a hooked Claude Code / Codex prompt could actually claim the
+    /// voice_turn signal. Gates the pre-submit will-speak indicator; false means a
+    /// bare voice_turn never lights the icon (post-submit speak_pending still does).
+    private var lastDictationTargetIsCLIHost = false
+
+    private var isTyping = false  // prevent concurrent typeText
+
+    /// Minimum sample count to bother transcribing (~0.1s at 16kHz mono).
+    private static let minSampleCount = 1600
+
+    /// The PID of the app that was frontmost when the user pressed the hotkey.
+    /// Captured on the main thread at press-time, before any focus shifts.
+    private var targetPID: pid_t = 0
+    /// The last "real" (regular, Dock-bearing) app the user activated. Used as the
+    /// target when dictation is triggered while ANY menubar-owned UI is frontmost —
+    /// our own popover or another menubar utility/agent (all .accessory) — so text
+    /// still lands in the app the user was actually working in.
+    private var lastRegularAppPID: pid_t = 0
+    private var activationObserver: NSObjectProtocol?
+    /// The PID of the app the user was in before auto-focus switched away.
+    /// Used by "with return" to re-activate the origin app after text insertion.
+    private var originPID: pid_t = 0
+
+    private var recorderSink: AnyCancellable?
+    private var engineErrorSink: AnyCancellable?
+    private var uploadWatchdog: DispatchWorkItem?
+    /// True once the STT model finished loading this session (main-thread only).
+    /// Sizes the transcription watchdog: a cold model's first dictation pays the
+    /// load inside the transcribe task, so it gets a longer leash.
+    private var sttWarm = false
+    /// The in-flight transcription. Cancelled on mode switch / timeout; a cancelled
+    /// task's result is dropped via the `Task.isCancelled` guard so it can never type
+    /// into the wrong app (the T1.2/T1.4 invariant). Note: cancelling does NOT interrupt
+    /// the model mid-inference — the guard, not the cancel, preserves correctness.
+    private var activeTranscribeTask: Task<Void, Never>?
+    /// True while a barge-in recording is active — prevents handleTTSStateChange from resetting to keyword mode
+    private var bargedIn = false
+    /// Monitors the TTS lock file for barge-in / mic muting
+    private var ttsLockMonitor: DispatchSourceFileSystemObject?
+    private var ttsLockTimer: Timer?
+
+    init() {
+        recorderSink = recorder.$state
+            .receive(on: RunLoop.main)
+            .sink { [weak self] newState in
+                self?.recorderState = newState
+            }
+
+        // Surface audio-engine failures to the UI instead of failing silently (T2.3)
+        engineErrorSink = recorder.$engineError
+            .receive(on: RunLoop.main)
+            .sink { [weak self] err in
+                if let err { self?.error = err }
+            }
+
+        // Wire keyword detector
+        keywordDetector.onKeywordDetected = { [weak self] keyword in
+            guard let self else { return }
+            switch keyword {
+            case .initiate:
+                self.handleInitiateKeyword()
+            case .holdOn:
+                self.handleBargeIn()
+            }
+        }
+
+        // Wire audio buffer feed from recorder to keyword detector
+        recorder.onRawAudioBuffer = { [weak self] buffer in
+            self?.keywordDetector.appendAudioBuffer(buffer)
+        }
+
+        // Wire silence detection callback
+        recorder.onSilenceTimeout = { [weak self] in
+            self?.handleSilenceTimeout()
+        }
+
+        // Load silence threshold from preferences
+        if let saved = try? String(contentsOf: Paths.silenceThreshold, encoding: .utf8),
+           let seconds = TimeInterval(saved.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            recorder.silenceThresholdSeconds = seconds
+        }
+
+        // Seed + continuously track the last regular (non-menubar) app, so dictation
+        // triggered while any menubar UI is frontmost still targets the real app.
+        if let front = NSWorkspace.shared.frontmostApplication,
+           front.activationPolicy == .regular,
+           front.bundleIdentifier != Bundle.main.bundleIdentifier {
+            lastRegularAppPID = front.processIdentifier
+        }
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.activationPolicy == .regular,
+                  app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+            self.lastRegularAppPID = app.processIdentifier
+        }
+    }
+
+    deinit {
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
+        speakArmedTimer?.invalidate()
+    }
+
+    /// Kick off the one-time Whisper model download + load. Call at launch so the
+    /// first dictation isn't blocked on a multi-minute download. Idempotent.
+    func prepareSTT() {
+        guard !sttModelReady else { return }
+        // Set expectations: the first launch downloads (~1.5 GB) and then compiles
+        // the model for the Neural Engine. Without this, a slow first load looks "stuck".
+        sttStatus = SpeechTranscriber.isModelCached
+            ? "Preparing the speech model… first launch compiles it for the Neural Engine. Dictation will be ready when it finishes."
+            : "Downloading the speech model… one-time, about 1.5 GB. This can take a few minutes on first launch."
+        Task { [weak self] in
+            guard let self else { return }
+            // Live percent while the archive downloads (first run only — the handler
+            // is never called when the model is cached). Whole-percent granularity
+            // keeps main-thread updates cheap.
+            let progressHandler: @Sendable (Double) -> Void = { [weak self] fraction in
+                let pct = min(100, Int(fraction * 100))
+                Task { @MainActor in
+                    guard let self, !self.sttModelReady, !self.sttFailed else { return }
+                    if pct >= 100 {
+                        self.sttStatus = "Download done — compiling for the Neural Engine…"
+                    } else if pct != self.lastReportedDownloadPct {
+                        self.lastReportedDownloadPct = pct
+                        self.sttStatus = "Downloading the speech model… \(pct)% of ~1.5 GB (one-time)."
+                    }
+                }
+            }
+            do {
+                await self.whisper.setDownloadProgressHandler(progressHandler)
+                _ = try await self.whisper.prepare()
+                await MainActor.run {
+                    self.sttModelReady = true
+                    self.sttWarm = true
+                    self.sttFailed = false
+                    self.sttStatus = nil
+                }
+            } catch {
+                let message = Self.sttFailureMessage(for: error)
+                await MainActor.run {
+                    self.sttFailed = true
+                    self.sttStatus = message
+                    self.error = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    /// Re-attempt the speech-model load after a failure (wired to a Retry button).
+    func retrySTT() {
+        sttFailed = false
+        sttModelReady = false
+        lastReportedDownloadPct = -1
+        prepareSTT()
+    }
+
+    /// A short, actionable message for a model-load failure.
+    /// Transcribe via Whisper, which self-prepares on first use, and mark the
+    /// model warm on success so the watchdog can tighten.
+    private func transcribeSTT(samples: [Float], language: String?) async throws -> String {
+        let text = try await whisper.transcribe(samples: samples, language: language)
+        // Fillers first: removing "um" restores word adjacency for the
+        // corrector's split-absorption window ("code, um, x" -> "Codex").
+        //
+        // English only. The filler list contains "um", which is the Portuguese
+        // masculine article and a German preposition ("Ich gehe um 5 Uhr"), so an
+        // unconditional pass deletes real words. `language == nil` is auto-detect —
+        // we can't know what was spoken, and Whisper already drops most fillers on
+        // its own, so skipping there is the safe default.
+        let defillered = (language == "en") ? DisfluencyFilter.apply(text) : text
+        let glossary = VocabularyCorrector.parseGlossary(
+            try? String(contentsOf: Paths.sttVocabulary, encoding: .utf8))
+        let corrected = VocabularyCorrector.apply(defillered, glossary: glossary)
+        await MainActor.run { self.sttWarm = true }
+        return corrected
+    }
+
+    /// Watchdog budget for one transcription: 35 s once the model is warm;
+    /// generous when the first dictation must load the model inside the task.
+    private func transcriptionTimeout() -> TimeInterval {
+        sttWarm ? 35 : 180
+    }
+
+    /// Kick the model load as recording starts, so a cold first dictation overlaps
+    /// the load with the user speaking instead of paying it all inside the
+    /// watchdogged transcribe task.
+    private func prewarmSTTIfNeeded() {
+        guard !sttWarm else { return }
+        sttStatus = "Loading the speech model… the first dictation can take a minute or two."
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.whisper.prepare()
+                await MainActor.run {
+                    self.sttWarm = true
+                    // Mirror prepareSTT's success state. Without this, a launch-time
+                    // load failure that later succeeds here left the menubar on the
+                    // hourglass and Advanced on "Loading…" while dictation worked.
+                    self.sttModelReady = true
+                    self.sttFailed = false
+                    self.sttStatus = nil
+                }
+            } catch {
+                await MainActor.run {
+                    self.sttFailed = true
+                    self.sttStatus = Self.sttFailureMessage(for: error)
+                }
+            }
+        }
+    }
+
+    private static func sttFailureMessage(for error: Error) -> String {
+        let text = error.localizedDescription.lowercased()
+        if text.contains("timed out") || text.contains("download") || text.contains("network")
+            || text.contains("connection") || text.contains("offline") {
+            return "Couldn't reach the speech model — a firewall may be blocking Hugging Face."
+        }
+        return "Speech model failed to load."
+    }
+
+    // MARK: - Capture Target App (call on main thread at hotkey PRESS, not release)
+
+    /// Called when the user presses the hotkey. Captures the PID of the current
+    /// frontmost app before any UI appears that could steal focus.
+    /// Must be called on the main thread.
+    func captureTargetApp() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        // Prefer the current frontmost app when it's a real (regular) app and not us.
+        if let front = NSWorkspace.shared.frontmostApplication,
+           front.activationPolicy == .regular,
+           front.bundleIdentifier != Bundle.main.bundleIdentifier {
+            targetPID = front.processIdentifier
+            lastRegularAppPID = targetPID
+            os_log(.default, log: dictLog, "Captured target PID %d (%{public}@)", targetPID, front.localizedName ?? "?")
+        } else if lastRegularAppPID != 0 {
+            // Frontmost is a menubar UI (our popover / another utility / an agent) —
+            // fall back to the last real app the user was working in.
+            targetPID = lastRegularAppPID
+            os_log(.default, log: dictLog, "Frontmost not a regular app; using last regular PID %d", targetPID)
+        }
+        // else: keep the previous targetPID
+    }
+
+    // MARK: - Mode Change Handling
+
+    private func handleModeChange(from oldMode: InteractionMode, to newMode: InteractionMode) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        os_log(.default, log: dictLog, "Mode changed: %{public}@ → %{public}@", oldMode.rawValue, newMode.rawValue)
+
+        // Tear down old mode
+        switch oldMode {
+        case .handsFree:
+            deactivateHandsFree()
+        case .pressToTalk, .holdToTalk:
+            break
+        }
+
+        // Set up new mode
+        switch newMode {
+        case .handsFree:
+            activateHandsFree()
+        case .pressToTalk, .holdToTalk:
+            // Ensure recorder is idle if switching away from hands-free
+            if recorder.state == .listening || recorder.state == .recording || recorder.state == .uploading {
+                uploadWatchdog?.cancel()
+                uploadWatchdog = nil
+                // Drop any in-flight transcription so its result can't type into the wrong app (T1.2)
+                activeTranscribeTask?.cancel()
+                activeTranscribeTask = nil
+                recorder.stopEngine()
+            }
+        }
+    }
+
+    // MARK: - Press-to-Talk (existing toggle behavior)
+
+    func toggle() {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        if interactionMode == .handsFree {
+            // In hands-free: PTT tap = instant submit if recording
+            if recorder.state == .recording {
+                bargedIn = false
+                playClick()
+                handsFreeFlushAndTranscribe()
+            }
+            return
+        }
+
+        switch recorder.state {
+        case .idle:
+            guard !isTyping else { return }
+            killTTS()
+            playClick()
+            prewarmSTTIfNeeded()
+            // captureTargetApp() already called by HotkeyManager.onKeyDown (L-4)
+            recorder.startRecording()
+        case .recording:
+            playClick()
+            finishAndTranscribe()
+        case .uploading, .listening:
+            break
+        }
+    }
+
+    // MARK: - Hold-to-Talk
+
+    /// Called on hotkey press-down for hold-to-talk mode.
+    func holdToTalkDown() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard interactionMode == .holdToTalk else { return }
+        guard recorder.state == .idle, !isTyping else { return }
+        killTTS()
+        playClick()
+        prewarmSTTIfNeeded()
+        captureTargetApp()
+        recorder.startRecording()
+    }
+
+    /// Called on hotkey release for hold-to-talk mode.
+    func holdToTalkUp() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard interactionMode == .holdToTalk else { return }
+        guard recorder.state == .recording else { return }
+        playClick()
+        finishAndTranscribe()
+    }
+
+    // MARK: - Hands-Free Mode
+
+    private func activateHandsFree() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        isCalibrating = true
+        recorder.silenceDetectionEnabled = true
+
+        // Start mic for calibration
+        recorder.startListening()
+
+        // Calibrate ambient noise
+        recorder.calibrateAmbient { [weak self] in
+            guard let self else { return }
+            self.isCalibrating = false
+            // Start keyword detection
+            self.keywordDetector.start()
+            // Start TTS lock monitoring
+            self.startTTSLockMonitoring()
+            os_log(.default, log: dictLog, "Hands-free activated, ambient: %.4f", self.recorder.ambientNoiseFloor)
+        }
+    }
+
+    private func deactivateHandsFree() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        uploadWatchdog?.cancel()
+        uploadWatchdog = nil
+        // Drop any in-flight transcription so its result can't type into the wrong app (T1.2)
+        activeTranscribeTask?.cancel()
+        activeTranscribeTask = nil
+        recorder.silenceDetectionEnabled = false
+        keywordDetector.stop()
+        stopTTSLockMonitoring()
+        if recorder.state == .listening || recorder.state == .recording || recorder.state == .uploading {
+            recorder.stopEngine()
+        }
+        isCalibrating = false
+        os_log(.default, log: dictLog, "Hands-free deactivated")
+    }
+
+    /// "Initiate" keyword detected — transition from listening to recording.
+    private func handleInitiateKeyword() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard interactionMode == .handsFree else { return }
+        guard recorder.state == .listening else { return }
+        os_log(.default, log: dictLog, "Keyword 'initiate' detected, starting STT recording")
+        // Stop keyword detector — it no longer auto-restarts on initiate (#5).
+        // It will be restarted after the STT cycle completes (resumeListening path).
+        keywordDetector.stop()
+        playClick()
+        prewarmSTTIfNeeded()
+        captureTargetApp()
+        recorder.startBuffering()
+    }
+
+    /// 3s silence detected — flush buffer and transcribe.
+    private func handleSilenceTimeout() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard interactionMode == .handsFree else { return }
+        guard recorder.state == .recording else { return }
+        os_log(.default, log: dictLog, "Silence timeout (threshold=%.0fs), flushing for transcription", recorder.silenceThresholdSeconds)
+        bargedIn = false
+        playClick()
+        handsFreeFlushAndTranscribe()
+    }
+
+    /// Flush current audio buffer and transcribe (hands-free — engine stays running).
+    private func handsFreeFlushAndTranscribe() {
+        let language = readLanguage()
+        let pid = targetPID
+
+        guard let samples = recorder.flushAndContinueFloat() else {
+            recorder.resumeListening()
+            keywordDetector.start()
+            return
+        }
+
+        // Skip very short recordings (~0.1s at 16kHz)
+        if samples.count < Self.minSampleCount {
+            recorder.resumeListening()
+            keywordDetector.start()
+            return
+        }
+
+        os_log(.default, log: dictLog, "Hands-free samples: %d", samples.count)
+
+        uploadWatchdog?.cancel()
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self, self.recorder.state == .uploading else { return }
+            os_log(.default, log: dictLog, "Watchdog: hands-free transcription timed out")
+            self.bargedIn = false
+            self.activeTranscribeTask?.cancel()
+            self.activeTranscribeTask = nil
+            self.isTyping = false
+            self.recorder.resumeListening()
+            self.keywordDetector.start()
+            self.error = "Transcription timed out"
+        }
+        uploadWatchdog = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + transcriptionTimeout(), execute: watchdog)
+
+        activeTranscribeTask = Task { [weak self] in
+            guard let self else { return }
+            let result: Result<String, Error>
+            do {
+                let text = try await self.transcribeSTT(samples: samples, language: language)
+                result = .success(text)
+            } catch {
+                result = .failure(error)
+            }
+            if Task.isCancelled { return }  // dropped by mode switch / watchdog (T1.4)
+            await MainActor.run { [weak self] in
+                self?.handleHandsFreeResult(result, pid: pid)
+            }
+        }
+    }
+
+    /// Main-thread completion for a hands-free transcription. Strips the trailing submit
+    /// phrase (as the server used to), types the text, and always presses Enter
+    /// (hands-free auto-submits). Resumes listening only if still hands-free (T1.4).
+    private func handleHandsFreeResult(_ result: Result<String, Error>, pid: pid_t) {
+        activeTranscribeTask = nil
+        uploadWatchdog?.cancel()
+        uploadWatchdog = nil
+
+        switch result {
+        case .success(let text):
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let (cleaned, _) = SubmitTrigger.process(trimmed)
+            if !cleaned.isEmpty {
+                os_log(.default, log: dictLog, "HF transcribed: %{public}@", cleaned)
+                lastTranscription = cleaned
+                error = nil
+                isTyping = true
+                insertText(cleaned, intoPID: pid, forceSubmit: true) { [weak self] in
+                    guard let self else { return }
+                    self.isTyping = false
+                    guard self.interactionMode == .handsFree else { return }
+                    self.recorder.resumeListening()
+                    self.keywordDetector.start()
+                }
+                return
+            }
+        case .failure(let err):
+            os_log(.default, log: dictLog, "HF transcription failed: %{public}@", err.localizedDescription)
+            error = err.localizedDescription
+        }
+
+        // Empty result or failure — resume listening only if still hands-free (T1.4)
+        guard interactionMode == .handsFree else { return }
+        recorder.resumeListening()
+        keywordDetector.start()
+    }
+
+    // MARK: - Barge-in
+
+    /// "Hold on" detected during TTS — kill TTS and start recording.
+    private func handleBargeIn() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard interactionMode == .handsFree, ttsPlaying else { return }
+        // Only barge-in when recorder is in a state that can transition to recording (L-1)
+        guard recorder.state == .listening || recorder.state == .idle else { return }
+        os_log(.default, log: dictLog, "Barge-in: 'hold on' detected, killing TTS")
+        bargedIn = true
+        // Stop keyword detector before recording — matches handleInitiateKeyword pattern
+        keywordDetector.stop()
+        killTTS()
+        playClick()
+        prewarmSTTIfNeeded()
+        captureTargetApp()
+        recorder.startBuffering()
+    }
+
+    // MARK: - TTS Lock File Monitoring
+
+    private func startTTSLockMonitoring() {
+        // Poll for lock file every 0.5s (simpler and more reliable than DispatchSource)
+        // Use .common RunLoop mode so timer fires even when menubar popover is open (L-6)
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let lockPath = Paths.appSupport.appendingPathComponent("tts_playing.lock").path
+            let playing = FileManager.default.fileExists(atPath: lockPath)
+            if playing != self.ttsPlaying {
+                self.ttsPlaying = playing
+                self.handleTTSStateChange(playing: playing)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        ttsLockTimer = timer
+    }
+
+    private func stopTTSLockMonitoring() {
+        ttsLockTimer?.invalidate()
+        ttsLockTimer = nil
+        ttsPlaying = false
+    }
+
+    private func handleTTSStateChange(playing: Bool) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard interactionMode == .handsFree else { return }
+
+        if playing {
+            // TTS started — stop STT buffering, keep keyword detection for barge-in
+            os_log(.default, log: dictLog, "TTS started — muting STT, listening for barge-in")
+            if recorder.state == .recording {
+                // Discard any buffered audio during TTS transition
+                recorder.resumeListening()
+            }
+            // Ensure keyword detector is running for "hold on" barge-in (L-2)
+            if !keywordDetector.isRunning {
+                keywordDetector.start()
+            }
+        } else {
+            // TTS finished — resume listening for "initiate" (unless barge-in is active)
+            if bargedIn {
+                os_log(.default, log: dictLog, "TTS ended after barge-in — recording in progress, skipping reset")
+                return
+            }
+            os_log(.default, log: dictLog, "TTS ended — resuming keyword listening")
+            if recorder.state != .uploading {
+                recorder.resumeListening()
+                keywordDetector.start()
+            }
+        }
+    }
+
+    // MARK: - Press-to-Talk Finish Recording & Transcribe
+
+    private func finishAndTranscribe() {
+        recorder.stopRecording()  // → .uploading; engine stopped, buffers complete
+
+        let language = readLanguage()
+        let pid = targetPID  // capture on main thread right now
+
+        // Cancel any previous watchdog before creating a new one (C-5)
+        uploadWatchdog?.cancel()
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self, self.recorder.state == .uploading else { return }
+            os_log(.default, log: dictLog, "Watchdog: transcription exceeded 35s, forcing reset")
+            self.activeTranscribeTask?.cancel()
+            self.activeTranscribeTask = nil
+            self.isTyping = false  // Clear isTyping so dictation isn't bricked (C-1)
+            self.recorder.reset()
+            self.error = "Transcription timed out"
+        }
+        uploadWatchdog = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + transcriptionTimeout(), execute: watchdog)
+
+        guard let samples = recorder.exportPCMFloat() else {
+            uploadWatchdog?.cancel()
+            uploadWatchdog = nil
+            recorder.reset()
+            return
+        }
+
+        // Skip very short recordings (~0.1s at 16kHz)
+        if samples.count < Self.minSampleCount {
+            uploadWatchdog?.cancel()
+            uploadWatchdog = nil
+            recorder.reset()
+            return
+        }
+
+        os_log(.default, log: dictLog, "PTT samples: %d, transcribing", samples.count)
+
+        activeTranscribeTask = Task { [weak self] in
+            guard let self else { return }
+            let result: Result<String, Error>
+            do {
+                let text = try await self.transcribeSTT(samples: samples, language: language)
+                result = .success(text)
+            } catch {
+                result = .failure(error)
+            }
+            if Task.isCancelled { return }  // dropped by mode switch / watchdog (T1.2)
+            await MainActor.run { [weak self] in
+                self?.handlePushToTalkResult(result, pid: pid)
+            }
+        }
+    }
+
+    /// Main-thread completion for a push-to-talk transcription. When the auto-submit
+    /// flag is set, strip the trailing trigger phrase (as the server used to) and let
+    /// `insertText` press Enter — it already does so whenever the flag exists, so there
+    /// is exactly one Enter and no double-submit.
+    private func handlePushToTalkResult(_ result: Result<String, Error>, pid: pid_t) {
+        activeTranscribeTask = nil
+        uploadWatchdog?.cancel()
+        uploadWatchdog = nil
+        recorder.reset()
+
+        switch result {
+        case .success(let text):
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let autoSubmit = FileManager.default.fileExists(atPath: Paths.autoSubmitFlag.path)
+            let finalText = autoSubmit ? SubmitTrigger.process(trimmed).cleaned : trimmed
+            os_log(.default, log: dictLog, "Transcribed: %{public}@, inserting into PID %d", finalText, pid)
+            lastTranscription = finalText
+            error = nil
+            isTyping = true
+            insertText(finalText, intoPID: pid) { [weak self] in
+                self?.isTyping = false
+            }
+        case .failure(let err):
+            os_log(.default, log: dictLog, "Transcription failed: %{public}@", err.localizedDescription)
+            error = err.localizedDescription
+        }
+    }
+
+    /// Play a subtle click sound on record start/stop (like Voquill's switch sound).
+    private func playClick() {
+        NSSound(named: "Tink")?.play()
+    }
+
+    // MARK: - Will-speak indicator
+
+    /// Matches the 900 s voice_turn TTL in voice-context.sh / codex-tts-hook.sh. This is the
+    /// window in which a dictated prompt can still be *claimed*, so it must not be shortened
+    /// independently of the hooks.
+    private static let voiceTurnTTL: TimeInterval = 900
+
+    /// How long the will-speak indicator stays lit on a signal nobody has claimed —
+    /// deliberately far shorter than `voiceTurnTTL`. The hook must still match a dictation
+    /// submitted minutes later, but the *icon* has no reason to wait that long: dictating and
+    /// then not submitting (or editing the prompt first) used to pin the speaker for the full
+    /// 15 minutes, which reads as a stuck indicator rather than an armed one.
+    private static let speakArmedTTL: TimeInterval = 90
+
+    /// Apps where a hooked CLI prompt could plausibly live — the curated auto-focus
+    /// list (terminals + editors) plus common extra terminals. Lowercased names.
+    private static let cliHostNames: Set<String> = [
+        "code", "code - insiders", "cursor", "windsurf", "zed", "xcode",
+        "sublime text", "nova", "fleet", "claude", "terminal", "iterm2",
+        "warp", "alacritty", "ghostty", "kitty", "wezterm", "hyper", "tabby",
+    ]
+
+    private static func isCLIHost(pid: pid_t) -> Bool {
+        guard pid != 0, let app = NSRunningApplication(processIdentifier: pid),
+              let name = app.localizedName?.lowercased() else { return false }
+        if cliHostNames.contains(name) { return true }
+        // A user-configured auto-focus target is a deliberate CLI destination
+        // even when it isn't on the curated list.
+        if let focus = (try? String(contentsOf: Paths.autoFocusApp, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !focus.isEmpty, name == focus {
+            return true
+        }
+        return false
+    }
+
+    /// Recompute `speakArmed` from the on-disk signals and keep a 1 s poll running
+    /// while it's on (the hooks consume the files out-of-process, so the app has to
+    /// watch for the transition). Cheap: two stat/read calls per tick, only while armed.
+    func refreshSpeakArmed() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        Self.sweepExpiredVoiceTurn()
+        let armed = Self.computeSpeakArmed(voiceTurnEligible: lastDictationTargetIsCLIHost)
+        if speakArmed != armed { speakArmed = armed }
+        if armed, speakArmedTimer == nil {
+            speakArmedTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                self?.refreshSpeakArmed()
+            }
+        } else if !armed {
+            speakArmedTimer?.invalidate()
+            speakArmedTimer = nil
+        }
+    }
+
+    /// Delete a `voice_turn` that can no longer be claimed by anyone.
+    ///
+    /// The hooks sweep a stale signal too, but only when they happen to run — dictate into an
+    /// app that never submits to an agent and the file otherwise sits on disk indefinitely
+    /// (observed: a signal still present 1911 s after it was written).
+    ///
+    /// Uses the full `voiceTurnTTL`, **not** the shorter `speakArmedTTL`: the indicator gives
+    /// up early, but a dictation the user submits several minutes later must still match, so
+    /// deleting on the indicator's schedule would silence legitimately dictated turns.
+    /// A signal with no parseable timestamp is left alone — the hooks treat that as
+    /// never-expiring and can still claim it by hash.
+    private static func sweepExpiredVoiceTurn() {
+        guard let contents = try? String(contentsOf: Paths.voiceTurn, encoding: .utf8) else { return }
+        let lines = contents.split(separator: "\n")
+        guard lines.count >= 2, let ts = TimeInterval(lines[1]) else { return }
+        guard Date().timeIntervalSince1970 - ts > voiceTurnTTL else { return }
+        try? FileManager.default.removeItem(at: Paths.voiceTurn)
+    }
+
+    private static func computeSpeakArmed(voiceTurnEligible: Bool) -> Bool {
+        let fm = FileManager.default
+        let now = Date()
+        // Pre-submit: a fresh unclaimed voice_turn — except in "text" Response mode,
+        // where a dictated turn is exactly the one that will NOT be spoken, and only
+        // when the dictation landed in a CLI host (voiceTurnEligible) — otherwise the
+        // signal can never be claimed and the icon would pin for the full TTL.
+        let mode = (try? String(contentsOf: Paths.ttsResponseMode, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "voice"
+        if voiceTurnEligible, mode != "text",
+           let contents = try? String(contentsOf: Paths.voiceTurn, encoding: .utf8) {
+            let lines = contents.split(separator: "\n")
+            if lines.count >= 2, let ts = TimeInterval(lines[1]),
+               now.timeIntervalSince1970 - ts <= speakArmedTTL {
+                return true
+            }
+        }
+        // Post-submit: a claimed turn awaiting its reply (any mode — the marker only
+        // exists for turns the hooks decided to speak). Same freshness cap so a
+        // marker orphaned by a killed session can't pin the indicator on.
+        if let entries = try? fm.contentsOfDirectory(at: Paths.speakPendingDir,
+                                                     includingPropertiesForKeys: [.contentModificationDateKey]) {
+            for entry in entries {
+                if let mtime = try? entry.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate,
+                   now.timeIntervalSince(mtime) <= voiceTurnTTL {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Barge-in: stop any currently playing TTS when recording starts. Playback is in-process
+    /// (Phase 3) — a direct actor call stops audio and cancels pending synthesis (freeing the ANE
+    /// for STT). The controller removes `tts_playing.lock`; we also remove it directly so the
+    /// lock-file poll reacts immediately even if the controller is unset.
+    func killTTS() {
+        let controller = ttsController
+        Task { await controller?.bargeIn() }
+        try? FileManager.default.removeItem(
+            at: Paths.appSupport.appendingPathComponent("tts_playing.lock"))
+    }
+
+    // MARK: - Insert Text (main thread orchestrator)
+
+    /// Inserts `text` into the application identified by `pid`.
+    /// Must be called on the main thread. `completion` is called on the main thread.
+    private func insertText(_ text: String, intoPID pid: pid_t, forceSubmit: Bool = false, completion: @escaping () -> Void) {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        // Record the voice-turn signal so the UserPromptSubmit hook can recognise
+        // THIS dictation as the voice turn (content-correlation). Written BEFORE the
+        // auto-submit Enter so the signal exists when the hook fires.
+        let voiceHash = VoiceSignal.canonicalHash(text)
+        let voiceTS = Int(Date().timeIntervalSince1970)
+        try? VoiceSignal.signalContents(hash: voiceHash, timestamp: voiceTS)
+            .write(to: Paths.voiceTurn, atomically: true, encoding: .utf8)
+
+        // Resolve which app to focus: Auto-Focus target overrides captured PID
+        let focusPID = resolveAutoFocusPID() ?? pid
+        let targetPID = focusPID != 0 ? focusPID : pid
+
+        // Arm the will-speak indicator only when the dictation landed in a
+        // plausible CLI host — dictating into WhatsApp/Safari/Mail writes the
+        // signal too (the handshake can't know where you'll submit), but nothing
+        // there will ever claim it, so the icon would sit lit for the full TTL.
+        lastDictationTargetIsCLIHost = Self.isCLIHost(pid: targetPID)
+        refreshSpeakArmed()
+
+        // Capture current frontmost app as origin (for "with return")
+        let currentFront = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        let shouldReturn = autoFocusReturnEnabled && targetPID != 0 && currentFront != targetPID && currentFront != 0
+        let returnPID = shouldReturn ? currentFront : 0
+
+        // Wrap completion: auto-submit (Enter) first, then return to origin app
+        let autoSubmitEnabled = FileManager.default.fileExists(atPath: Paths.autoSubmitFlag.path)
+        let wrappedCompletion: () -> Void = {
+            let returnBlock = {
+                if returnPID != 0, let originApp = NSRunningApplication(processIdentifier: returnPID) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        originApp.activate()
+                        os_log(.default, log: dictLog, "Returning to origin app: %{public}@ (PID %d)",
+                               originApp.localizedName ?? "?", returnPID)
+                    }
+                }
+                completion()
+            }
+
+            if autoSubmitEnabled || forceSubmit {
+                // Press Enter after text insertion, before returning
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    if let enterDown = CGEvent(keyboardEventSource: nil, virtualKey: 0x24, keyDown: true),
+                       let enterUp = CGEvent(keyboardEventSource: nil, virtualKey: 0x24, keyDown: false) {
+                        enterDown.post(tap: .cgSessionEventTap)
+                        enterUp.post(tap: .cgSessionEventTap)
+                        os_log(.default, log: dictLog, "Auto-submit: Enter pressed")
+                    }
+                    // Delay return to let Enter propagate
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        returnBlock()
+                    }
+                }
+            } else {
+                returnBlock()
+            }
+        }
+
+        // Check if target app is already frontmost
+        let alreadyFocused = currentFront == targetPID
+
+        // Activate the target app BEFORE any text insertion (native activation)
+        if !alreadyFocused, targetPID != 0, let app = NSRunningApplication(processIdentifier: targetPID) {
+            app.activate()
+            os_log(.default, log: dictLog, "Activating app: %{public}@ (PID %d)", app.localizedName ?? "?", targetPID)
+            // Delay to let activation complete before inserting text
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.doInsertText(text, pid: targetPID, completion: wrappedCompletion)
+            }
+            return
+        }
+
+        doInsertText(text, pid: targetPID, completion: wrappedCompletion)
+    }
+
+    /// Whether "with return" is enabled (return to origin app after auto-focus insertion).
+    private var autoFocusReturnEnabled: Bool {
+        FileManager.default.fileExists(atPath: Paths.autoFocusReturn.path)
+    }
+
+    /// Performs the actual text insertion after the target app is focused.
+    private func doInsertText(_ text: String, pid: pid_t, completion: @escaping () -> Void) {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        // Tier 1: AXUIElement — works for native AppKit apps
+        if pid != 0 && insertViaAccessibility(text, pid: pid) {
+            os_log(.default, log: dictLog, "Inserted via AXUIElement for PID %d", pid)
+            completion()
+            return
+        }
+
+        os_log(.default, log: dictLog, "AX insert failed, falling back to CGEvent Unicode typing")
+
+        // Tier 2: CGEvent keyboardSetUnicodeString — types text without touching clipboard
+        typeViaUnicodeEvents(text) {
+            completion()
+        }
+    }
+
+    // MARK: - Auto-Focus Resolution
+
+    /// If Auto-Focus is enabled, find the PID of the configured app.
+    /// Returns nil if Auto-Focus is not enabled or app isn't running.
+    private func resolveAutoFocusPID() -> pid_t? {
+        guard let value = try? String(contentsOf: Paths.autoFocusApp, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        let apps = NSWorkspace.shared.runningApplications
+        switch FocusTarget.parse(value) {
+        case .bundleID(let bid):
+            // Installed-app pick — match by bundle identifier (robust, locale-independent).
+            return apps.first(where: { $0.bundleIdentifier == bid })?.processIdentifier
+        case .name(let name):
+            // Curated favorites + custom + legacy values store the display name.
+            if let app = apps.first(where: { $0.localizedName == name }) {
+                return app.processIdentifier
+            }
+            // Bundle-name prefix (e.g. "Code" matches "Code - Insiders") (#17)
+            if let app = apps.first(where: { ($0.localizedName ?? "").hasPrefix(name) }) {
+                return app.processIdentifier
+            }
+            return nil
+        }
+    }
+
+    // MARK: - AXUIElement Text Insertion
+
+    /// Attempts to insert `text` at the cursor position in the app with the given PID.
+    /// Must be called on the main thread.
+    /// Returns true on success.
+    private func insertViaAccessibility(_ text: String, pid: pid_t) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        // Verify Accessibility permission is actually granted before any AX calls.
+        // Pass false so we don't trigger the system prompt here (should already be granted).
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
+        guard AXIsProcessTrustedWithOptions(opts as CFDictionary) else {
+            os_log(.default, log: dictLog, "AX: process not trusted (permission not granted)")
+            return false
+        }
+
+        let appElement = AXUIElementCreateApplication(pid)
+
+        // Get the focused UI element within that specific app.
+        var focusedValue: AnyObject?
+        let focusErr = AXUIElementCopyAttributeValue(
+            appElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedValue
+        )
+        guard focusErr == .success, let focused = focusedValue else {
+            os_log(.default, log: dictLog, "AX: no focused element for PID %d (err=%d)", pid, focusErr.rawValue)
+            return false
+        }
+        // CFTypeID check: AXUIElementCopyAttributeValue returns AnyObject (CFTypeRef).
+        // Direct `as? AXUIElement` always succeeds for CF types, so compare CFTypeIDs.
+        guard CFGetTypeID(focused as CFTypeRef) == AXUIElementGetTypeID() else {
+            os_log(.default, log: dictLog, "AX: focused element is not AXUIElement for PID %d", pid)
+            return false
+        }
+        let element = focused as! AXUIElement
+
+        // Strategy A: kAXSelectedTextAttribute — replaces current selection / inserts at cursor.
+        // Works for NSTextField, NSTextView, and most native AppKit fields.
+        var isSettable: DarwinBoolean = false
+        let settableErr = AXUIElementIsAttributeSettable(
+            element,
+            kAXSelectedTextAttribute as CFString,
+            &isSettable
+        )
+
+        if settableErr == .success && isSettable.boolValue {
+            let setErr = AXUIElementSetAttributeValue(
+                element,
+                kAXSelectedTextAttribute as CFString,
+                text as CFString
+            )
+            if setErr == .success {
+                os_log(.default, log: dictLog, "AX: StrategyA success for PID %d", pid)
+                return true
+            }
+            os_log(.default, log: dictLog, "AX: StrategyA set failed (err=%d)", setErr.rawValue)
+        } else {
+            os_log(.default, log: dictLog, "AX: StrategyA not settable (settableErr=%d, settable=%d)", settableErr.rawValue, isSettable.boolValue ? 1 : 0)
+        }
+
+        // Strategy B: kAXValueAttribute — works for some single-line fields that don't
+        // expose kAXSelectedTextAttribute as settable but do expose kAXValue.
+        var valueSettable: DarwinBoolean = false
+        AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &valueSettable)
+
+        if valueSettable.boolValue {
+            // Read existing value so we can append rather than replace
+            var existingValue: AnyObject?
+            AXUIElementCopyAttributeValue(
+                element,
+                kAXValueAttribute as CFString,
+                &existingValue
+            )
+            let existing = (existingValue as? String) ?? ""
+
+            // Get insertion point to insert at cursor position
+            var rangeValue: AnyObject?
+            var insertionIndex = (existing as NSString).length
+            if AXUIElementCopyAttributeValue(
+                element,
+                kAXSelectedTextRangeAttribute as CFString,
+                &rangeValue
+            ) == .success, let rv = rangeValue {
+                var cfRange = CFRangeMake(0, 0)
+                if CFGetTypeID(rv as CFTypeRef) == AXValueGetTypeID(),
+                   AXValueGetValue(rv as! AXValue, .cfRange, &cfRange) {
+                    insertionIndex = cfRange.location
+                }
+            }
+
+            let nsExisting = existing as NSString
+            let safeIndex = min(insertionIndex, nsExisting.length)
+            // Use NSString for insertion to stay in UTF-16 space (matches CFRange)
+            let nsNew = nsExisting.replacingCharacters(
+                in: NSRange(location: safeIndex, length: 0),
+                with: text
+            )
+
+            let setErr = AXUIElementSetAttributeValue(
+                element,
+                kAXValueAttribute as CFString,
+                nsNew as CFString
+            )
+            if setErr == .success {
+                // Move cursor to end of inserted text (UTF-16 length)
+                var newRange = CFRangeMake(safeIndex + (text as NSString).length, 0)
+                if let axRange = AXValueCreate(.cfRange, &newRange) {
+                    AXUIElementSetAttributeValue(
+                        element,
+                        kAXSelectedTextRangeAttribute as CFString,
+                        axRange
+                    )
+                }
+                os_log(.default, log: dictLog, "AX: StrategyB success for PID %d", pid)
+                return true
+            }
+            os_log(.default, log: dictLog, "AX: StrategyB set failed (err=%d)", setErr.rawValue)
+        }
+
+        return false
+    }
+
+    // MARK: - CGEvent Unicode Typing
+
+    /// Types `text` by posting CGEvent keystrokes with `keyboardSetUnicodeString`.
+    /// No clipboard involvement — each chunk is sent as a key-down/key-up pair.
+    /// macOS limit is ~20 UTF-16 code units per event; we use chunks of 16 for safety.
+    private func typeViaUnicodeEvents(_ text: String, completion: @escaping () -> Void) {
+        let utf16 = Array(text.utf16)
+        let chunkSize = 16
+        let chunks = stride(from: 0, to: utf16.count, by: chunkSize).map {
+            Array(utf16[$0..<min($0 + chunkSize, utf16.count)])
+        }
+
+        func typeChunk(at index: Int) {
+            guard index < chunks.count else {
+                diagLog("CGEvent Unicode typing done (\(utf16.count) UTF-16 units)")
+                completion()
+                return
+            }
+
+            var chunk = chunks[index]
+            guard
+                let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+            else {
+                self.error = "Typing failed — grant Accessibility permission in System Settings"
+                diagLog("CGEvent creation failed at chunk \(index)")
+                completion()
+                return
+            }
+
+            keyDown.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
+            keyUp.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
+
+            keyDown.post(tap: .cgSessionEventTap)
+            keyUp.post(tap: .cgSessionEventTap)
+
+            // Small delay between chunks to let the target app process input (#22)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.003) {
+                typeChunk(at: index + 1)
+            }
+        }
+
+        typeChunk(at: 0)
+    }
+
+    // MARK: - Diagnostic Log
+
+    private static let diagQueue = DispatchQueue(label: "com.openwhisperer.diaglog", qos: .utility)
+    /// Formatter lives on diagQueue — only accessed there to avoid thread-safety issues (M-8)
+    private static let diagFormatter = ISO8601DateFormatter()
+
+    private func diagLog(_ msg: String) {
+        let date = Date()
+        Self.diagQueue.async {
+            let timestamp = Self.diagFormatter.string(from: date)
+            guard let data = "[\(timestamp)] \(msg)\n".data(using: .utf8) else { return }
+            let diagPath = Paths.appSupport.appendingPathComponent("paste_debug.log")
+            if FileManager.default.fileExists(atPath: diagPath.path) {
+                if let fh = try? FileHandle(forWritingTo: diagPath) {
+                    fh.seekToEndOfFile()
+                    fh.write(data)
+                    try? fh.close()
+                }
+            } else {
+                try? data.write(to: diagPath)
+            }
+        }
+    }
+
+    // MARK: - Language
+
+    private func readLanguage() -> String? {
+        let path = Paths.sttLanguage.path
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        let lang = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        return lang.isEmpty || lang == "auto" ? nil : lang
+    }
+}

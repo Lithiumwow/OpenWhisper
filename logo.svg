@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <clipPath id="iconClip">
+      <rect width="1024" height="1024" rx="230" ry="230"/>
+    </clipPath>
+  </defs>
+  <!-- Cream background for macOS dock squircle -->
+  <rect width="1024" height="1024" rx="230" ry="230" fill="#F5F5F4"/>
+  <g clip-path="url(#iconClip)">
+    <!-- Diamond: 4 faces, rotated 45°, staggered opacity -->
+    <g transform="translate(512,512) rotate(45) translate(-352,-352)">
+      <!-- Face 1: top-left (first to fold in, first to start fading) -->
+      <rect x="0" y="0" width="345" height="345" rx="40" fill="#C4A87D" opacity="0.6"/>
+      <!-- Face 2: top-right -->
+      <rect x="359" y="0" width="345" height="345" rx="40" fill="#C4A87D" opacity="0.75"/>
+      <!-- Face 3: bottom-right -->
+      <rect x="359" y="359" width="345" height="345" rx="40" fill="#C4A87D" opacity="0.88"/>
+      <!-- Face 4: bottom-left (last in, fully visible) -->
+      <rect x="0" y="359" width="345" height="345" rx="40" fill="#C4A87D" opacity="1"/>
+    </g>
+  </g>
+</svg>

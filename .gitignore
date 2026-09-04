@@ -1,0 +1,61 @@
+# Build artifacts
+build/
+app/.build/
+*.dmg
+
+# Local-only diagnostic tools (kept on disk, not committed)
+app/Tools/
+
+# Local bin/ directory
+bin/
+lib/
+share/
+include/
+pyvenv.cfg
+__pycache__/
+*.pyc
+venv/
+.venv/
+.pytest_cache/
+
+# macOS
+.DS_Store
+CACHEDIR.TAG
+.lock
+
+# IDE
+*.xcodeproj
+*.xcworkspace
+docs/plans/hands-free-mode-plan.md
+ROADMAP.md
+
+# Claude Code local (machine-specific) settings
+.claude/settings.local.json
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Large / local media & Windows audio-to-srt resources (download or generate locally)
+*.m4a
+*.mp3
+*.wav
+*.flac
+*.aac
+*.mp4
+*.mkv
+*.webm
+audio-to-srt/.venv/
+audio-to-srt/ffmpeg.exe
+audio-to-srt/ffplay.exe
+audio-to-srt/ffprobe.exe
+audio-to-srt/input/**
+!audio-to-srt/input/.gitkeep
+audio-to-srt/output/**
+!audio-to-srt/output/.gitkeep
+audio-to-srt/__pycache__/
+
+# Local tooling noise
+.playwright-mcp/
+todo.md
