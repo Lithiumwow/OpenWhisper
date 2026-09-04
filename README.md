@@ -28,6 +28,7 @@ Windows-focused work that is **not** part of the original Mac app:
 - **`audio-to-srt/`** — local transcription pipeline for Windows (CUDA when available).
 - **Live progress** — `% done` / `% left` and time while Whisper runs.
 - **`--speakers`** — pyannote diarization, sample lines every N seconds, you name each voice once, names applied across the whole SRT.
+- **Live Teams / speaker capture** — `record_call.py` records Windows speaker output (WASAPI loopback) during a call; Ctrl+C stops and builds the SRT.
 - **Caches** — reuses existing SRT / `.cues.json` / `.diarization.json` so you don’t re-run Whisper or diarization every time.
 - **Windows torchcodec workaround** — feeds audio in-memory so pyannote doesn’t need broken FFmpeg DLLs.
 - **`.env` + `.env.example`** — `HF_TOKEN` for gated pyannote models (token never committed).
@@ -102,6 +103,17 @@ Useful flags:
 | `--force-diarize` | Re-run diarization even if `.diarization.json` exists |
 | `--play-samples` | Play a short clip when naming (needs `ffplay`) |
 
+### Live Teams call (speaker output → SRT)
+
+```powershell
+cd audio-to-srt
+.\.venv\Scripts\pip.exe install -r requirements-live.txt   # once
+.\.venv\Scripts\python.exe record_call.py --list-devices
+.\.venv\Scripts\python.exe record_call.py --loopback Chat --model medium --txt
+```
+
+Records what you hear on that playback device; **Ctrl+C** ends the call capture and generates the SRT. See [audio-to-srt/README.md](audio-to-srt/README.md).
+
 ---
 
 ## Mac: OpenWhisperer app
@@ -151,8 +163,11 @@ OpenWhisper/
 ├── AGENTS.md                 # architecture + commands for contributors
 ├── audio-to-srt/             # Windows: Whisper → SRT (+ optional speakers)
 │   ├── transcribe_to_srt.py
+│   ├── record_call.py        # Teams/speaker loopback → WAV → SRT
 │   ├── transcribe.bat
+│   ├── record_call.bat
 │   ├── requirements-speakers.txt
+│   ├── requirements-live.txt
 │   ├── input/                # put audio here (gitignored contents)
 │   └── output/               # SRT/TXT/caches (gitignored contents)
 ├── app/                      # macOS Swift menubar app

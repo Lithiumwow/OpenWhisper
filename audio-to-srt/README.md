@@ -76,3 +76,43 @@ HF_TOKEN=hf_your_token_here
 ```
 
 Larger models = better accuracy, slower first download.
+
+## Live Teams / speaker capture
+
+Record **what plays through your speakers/headphones** (WASAPI loopback), then
+transcribe to SRT when you stop. Good for Teams calls: you hear remote audio;
+this captures that mix (not your microphone).
+
+### Setup (once)
+
+```powershell
+.\.venv\Scripts\pip.exe install -r requirements-live.txt
+```
+
+### Record a call
+
+1. Start the script **before or during** the call.
+2. Make sure Teams audio is going to the device you capture (default speaker, or pick one).
+3. Press **Ctrl+C** when the call ends — it saves a WAV and runs Whisper → SRT.
+
+```powershell
+# list devices (use a name substring with --loopback)
+.\.venv\Scripts\python.exe record_call.py --list-devices
+
+# default speaker loopback → output\call-YYYYMMDD-HHMMSS.wav → SRT
+.\.venv\Scripts\python.exe record_call.py --model medium --txt
+
+# e.g. SteelSeries "Chat" or headphones
+.\.venv\Scripts\python.exe record_call.py --loopback Chat --model medium --txt
+
+# after recording, also run speaker naming
+.\.venv\Scripts\python.exe record_call.py --loopback Headphones --speakers --txt
+```
+
+Or double-click `record_call.bat`.
+
+Tips:
+
+- If the level meter stays flat, Teams is using another output — `--list-devices` then `--loopback "…"`.
+- Your own voice is only included if it is also played back on that output (usually it is not).
+- `--no-transcribe` saves the WAV only.

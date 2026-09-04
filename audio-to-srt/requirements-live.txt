@@ -1,0 +1,3 @@
+# Capture Windows speaker output (Teams / WASAPI loopback) then transcribe.
+soundcard
+soundfile
